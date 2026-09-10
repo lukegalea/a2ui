@@ -16,13 +16,15 @@
 
 import inspect
 import os
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
-from pydantic import ConfigDict
+from pydantic import create_model
 import pytest
 import yaml
 
-from a2ui.builder import (
+from a2ui.builder.v0_9 import (
+    Child,
+    ChildList,
     ComponentBuilderNode,
     DataBinding,
 )
@@ -43,10 +45,44 @@ TYPE_MAP = {
 }
 
 
-class DynamicConformanceNode(ComponentBuilderNode):
-    """Dynamic AST node allowing arbitrary extra properties for conformance testing."""
+def _slot_annotation(value: Any) -> Any:
+    """Picks the annotation a generated catalog would declare for ``value``.
 
-    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+    Child resolution is annotation-driven: the :data:`Child` serializer is what
+    replaces a nested node with the ID it was allocated, and it only runs on
+    fields actually declared with that type. A node whose children arrive as
+    Pydantic *extras* is therefore invisible to the flattener and dumps as a
+    nested object, which is not valid on the wire.
+
+    Generated catalogs declare ``child: Child`` and ``children: ChildList``, so
+    the conformance nodes built from YAML templates must do the same.
+    """
+    if isinstance(value, ComponentBuilderNode):
+        return Child
+    if (
+        isinstance(value, (list, tuple))
+        and value
+        and all(isinstance(item, ComponentBuilderNode) for item in value)
+    ):
+        return ChildList
+    return Any
+
+
+def _build_conformance_node(component: Optional[str], props: dict[str, Any]):
+    """Builds a node type for one template node, declaring its slots properly.
+
+    Mirrors what the code generator emits for a real catalog component, rather
+    than accepting every property as an untyped extra.
+    """
+    fields: dict[str, Any] = {
+        name: (_slot_annotation(value), None) for name, value in props.items()
+    }
+    node_type = create_model(
+        f"Conformance{component or 'Node'}",
+        __base__=ComponentBuilderNode,
+        **fields,
+    )
+    return node_type(component=component, **props)
 
 
 def _get_conformance_path(filename: str) -> str:
@@ -95,7 +131,7 @@ def _eval_template(template: Any, kwargs: dict[str, Any]) -> Any:
             if k == "component":
                 continue
             props[k] = _eval_template(v, kwargs)
-        return DynamicConformanceNode(component=comp, **props)
+        return _build_conformance_node(comp, props)
 
     return template
 
